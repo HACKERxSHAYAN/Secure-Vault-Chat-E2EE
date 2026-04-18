@@ -1,7 +1,7 @@
 @echo off
-echo ============================================
+echo 
 echo Secure-Vault-Chat Build Script
-echo ============================================
+echo 
 echo.
 
 REM Check for MinGW-w64 g++

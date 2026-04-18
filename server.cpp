@@ -1,12 +1,3 @@
-/*
- * SECURE-VAULT-CHAT
- * Military-Grade End-to-End Encrypted Messaging System
- * Server Component - Zero-Knowledge Relay
- *
- * Cross-Platform: Windows (winsock2) & Linux (sys/socket)
- * Architecture: Client messages are encrypted before transmission.
- * Server only relays ciphertext, never sees plaintext.
- */
 
 #include <iostream>
 #include <string>
@@ -22,9 +13,9 @@
     #include <ws2tcpip.h>
     #pragma comment(lib, "ws2_32.lib")
     typedef SOCKET socket_t;
-    #define SOCKET_ERROR_VAL SOCKET_ERROR
-    #define CLOSE_SOCKET closesocket
-    #define GET_LAST_ERROR WSAGetLastError()
+    #define SOCK_ERR SOCKET_ERROR
+    #define CLOSE_SOCK closesocket
+    #define GET_ERR WSAGetLastError()
 #else
     #include <sys/socket.h>
     #include <netinet/in.h>
@@ -32,61 +23,59 @@
     #include <unistd.h>
     #include <netinet/tcp.h>
     typedef int socket_t;
-    #define SOCKET_ERROR_VAL (-1)
-    #define CLOSE_SOCKET close
-    #define GET_LAST_ERROR errno
+    #define SOCK_ERR (-1)
+    #define CLOSE_SOCK close
+    #define GET_ERR errno
 #endif
 
 #define PORT 8080
-#define BUFFER_SIZE 4096
+#define BUF_SZ 4096
 #define MAX_CLIENTS 10
 
-std::mutex clients_mutex;
-std::unordered_map<socket_t, std::string> client_sockets; // socket -> client ID
+std::mutex clients_lock;
+std::unordered_map<socket_t, std::string> active_clients;
 
 #if defined(_WIN32) || defined(_WIN64)
 bool init_winsock() {
-    WSADATA wsaData;
-    int result = WSAStartup(MAKEWORD(2, 2), &wsaData);
-    if (result != 0) {
-        std::cerr << "[-] WSAStartup failed: " << result << std::endl;
+    WSADATA wsa;
+    int err = WSAStartup(MAKEWORD(2, 2), &wsa);
+    if (err != 0) {
+        std::cerr << "[!] Winsock failed to start: " << err << std::endl;
         return false;
     }
     return true;
 }
 #endif
 
-void handle_client(socket_t client_socket, std::string client_id) {
-    char buffer[BUFFER_SIZE];
-    std::cout << "[+] Secure channel established for client: " << client_id << std::endl;
+void handle_client(socket_t client_sock, std::string client_id) {
+    char buf[BUF_SZ];
+    std::cout << "[+] Client connected: " << client_id << std::endl;
 
     while (true) {
-        memset(buffer, 0, BUFFER_SIZE);
+        memset(buf, 0, BUF_SZ);
         
-        ssize_t bytes_received = recv(client_socket, buffer, BUFFER_SIZE, 0);
+        ssize_t bytes = recv(client_sock, buf, BUF_SZ, 0);
         
-        if (bytes_received <= 0) {
-            std::cout << "[-] Client disconnected: " << client_id << std::endl;
+        if (bytes <= 0) {
+            std::cout << "[-] Client left: " << client_id << std::endl;
             break;
         }
 
-        std::string encrypted_message(buffer, bytes_received);
-
-        {
-            std::lock_guard<std::mutex> lock(clients_mutex);
-            for (auto& pair : client_sockets) {
-                if (pair.first != client_socket) {
-                    send(pair.first, encrypted_message.c_str(), encrypted_message.length(), 0);
-                }
+        std::string enc_msg(buf, bytes);
+        
+        std::lock_guard<std::mutex> lock(clients_lock);
+        for (auto& pair : active_clients) {
+            if (pair.first != client_sock) {
+                send(pair.first, enc_msg.c_str(), enc_msg.length(), 0);
             }
         }
     }
 
     {
-        std::lock_guard<std::mutex> lock(clients_mutex);
-        client_sockets.erase(client_socket);
+        std::lock_guard<std::mutex> lock(clients_lock);
+        active_clients.erase(client_sock);
     }
-    CLOSE_SOCKET(client_socket);
+    CLOSE_SOCK(client_sock);
 }
 
 int main() {
@@ -106,9 +95,9 @@ int main() {
     }
 #endif
 
-    socket_t server_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (server_fd == SOCKET_ERROR_VAL) {
-        std::cerr << "[-] Socket creation failed. Error: " << GET_LAST_ERROR << std::endl;
+    socket_t serv_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (serv_fd == SOCK_ERR) {
+        std::cerr << "[!] Socket creation error: " << GET_ERR << std::endl;
 #if defined(_WIN32) || defined(_WIN64)
         WSACleanup();
 #endif
@@ -116,45 +105,46 @@ int main() {
     }
 
     int opt = 1;
-    if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, (char*)&opt, sizeof(opt)) == SOCKET_ERROR_VAL) {
-        std::cerr << "[-] Setsockopt SO_REUSEADDR failed" << std::endl;
-        CLOSE_SOCKET(server_fd);
+    if (setsockopt(serv_fd, SOL_SOCKET, SO_REUSEADDR, (char*)&opt, sizeof(opt)) == SOCK_ERR) {
+        std::cerr << "[!] Setsockopt failed (SO_REUSEADDR)" << std::endl;
+        CLOSE_SOCK(serv_fd);
 #if defined(_WIN32) || defined(_WIN64)
         WSACleanup();
 #endif
         return -1;
     }
 
-    int tcp_nodelay = 1;
-    setsockopt(server_fd, IPPROTO_TCP, TCP_NODELAY, (char*)&tcp_nodelay, sizeof(tcp_nodelay));
+    int tcp_nd = 1;
+    setsockopt(serv_fd, IPPROTO_TCP, TCP_NODELAY, (char*)&tcp_nd, sizeof(tcp_nd));
 
-    struct sockaddr_in address;
-    std::memset(&address, 0, sizeof(address));
-    address.sin_family = AF_INET;
-    address.sin_addr.s_addr = INADDR_ANY;
-    address.sin_port = htons(PORT);
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_port = htons(PORT);
 
-    if (bind(server_fd, (struct sockaddr*)&address, sizeof(address)) < 0) {
-        std::cerr << "[-] Bind failed. Error: " << GET_LAST_ERROR << std::endl;
-        CLOSE_SOCKET(server_fd);
+    if (bind(serv_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+        std::cerr << "[!] Bind failed on port " << PORT << ". Error: " << GET_ERR << std::endl;
+        std::cerr << "    Maybe something else using that port?" << std::endl;
+        CLOSE_SOCK(serv_fd);
 #if defined(_WIN32) || defined(_WIN64)
         WSACleanup();
 #endif
         return -1;
     }
 
-    if (listen(server_fd, MAX_CLIENTS) < 0) {
-        std::cerr << "[-] Listen failed" << std::endl;
-        CLOSE_SOCKET(server_fd);
+    if (listen(serv_fd, MAX_CLIENTS) < 0) {
+        std::cerr << "[!] Listen call failed" << std::endl;
+        CLOSE_SOCK(serv_fd);
 #if defined(_WIN32) || defined(_WIN64)
         WSACleanup();
 #endif
         return -1;
     }
 
-    std::cout << "\n[+] SERVER RUNNING ON PORT " << PORT << std::endl;
-    std::cout << "[+] WAITING FOR SECURE CONNECTIONS..." << std::endl;
-    std::cout << "[+] MODE: ZERO-KNOWLEDGE RELAY (Ciphertext-Only)" << std::endl << std::endl;
+    std::cout << "\n[+] SERVER UP ON PORT " << PORT << std::endl;
+    std::cout << "[+] Waiting for clients... (Press Ctrl+C to stop)" << std::endl;
+    std::cout << "[+] MODE: ZERO-KNOWLEDGE RELAY\n" << std::endl;
 
     std::vector<std::thread> client_threads;
 
@@ -162,31 +152,31 @@ int main() {
         struct sockaddr_in client_addr;
         socklen_t addr_len = sizeof(client_addr);
         
-        socket_t client_socket = accept(server_fd, (struct sockaddr*)&client_addr, &addr_len);
-        if (client_socket == SOCKET_ERROR_VAL) {
-            std::cerr << "[-] Accept failed. Error: " << GET_LAST_ERROR << std::endl;
+        socket_t client_sock = accept(serv_fd, (struct sockaddr*)&client_addr, &addr_len);
+        if (client_sock == SOCK_ERR) {
+            std::cerr << "[!] Accept failed: " << GET_ERR << std::endl;
             continue;
         }
 
-        char client_ip[INET_ADDRSTRLEN];
-        inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, INET_ADDRSTRLEN);
-        std::string client_id = std::string(client_ip) + ":" + std::to_string(ntohs(client_addr.sin_port));
+        char ip_str[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &client_addr.sin_addr, ip_str, INET_ADDRSTRLEN);
+        std::string cli_id = std::string(ip_str) + ":" + std::to_string(ntohs(client_addr.sin_port));
 
-        std::cout << "[+] Secure connection from: " << client_id << std::endl;
+        std::cout << "[+] Connection from " << cli_id << std::endl;
 
         {
-            std::lock_guard<std::mutex> lock(clients_mutex);
-            client_sockets[client_socket] = client_id;
+            std::lock_guard<std::mutex> lock(clients_lock);
+            active_clients[client_sock] = cli_id;
         }
 
-        client_threads.emplace_back(handle_client, client_socket, client_id);
+        client_threads.emplace_back(handle_client, client_sock, cli_id);
     }
 
     for (auto& t : client_threads) {
         if (t.joinable()) t.join();
     }
 
-    CLOSE_SOCKET(server_fd);
+    CLOSE_SOCK(serv_fd);
 #if defined(_WIN32) || defined(_WIN64)
     WSACleanup();
 #endif

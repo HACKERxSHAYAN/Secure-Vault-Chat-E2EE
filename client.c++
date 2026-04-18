@@ -1,16 +1,3 @@
-/*
- * SECURE-VAULT-CHAT
- * Military-Grade End-to-End Encrypted Messaging System
- * Client Component - Encryption Engine + Socket Interface
- *
- * Architecture:
- * - Messages are encrypted BEFORE leaving this process
- * - Server receives ciphertext only (zero-knowledge)
- * - Decryption happens AFTER receiving ciphertext
- *
- * Crypto Scheme: Custom XOR-based cipher with rotating key
- * Security Properties: Semantic security through key rotation
- */
 
 #include <iostream>
 #include <string>

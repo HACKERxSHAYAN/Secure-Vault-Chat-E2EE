@@ -1,16 +1,3 @@
-/*
- * SECURE-VAULT-CHAT
- * Military-Grade End-to-End Encrypted Messaging System
- * Client Component - Encryption Engine + Socket Interface
- *
- * Architecture:
- * - Messages are encrypted BEFORE leaving this process
- * - Server receives ciphertext only (zero-knowledge)
- * - Decryption happens AFTER receiving ciphertext
- *
- * Crypto Scheme: Custom XOR-based cipher with rotating key
- * Security Properties: Semantic security through key rotation
- */
 
 #include <iostream>
 #include <string>
@@ -28,9 +15,9 @@
     #include <ws2tcpip.h>
     #pragma comment(lib, "ws2_32.lib")
     typedef SOCKET socket_t;
-    #define SOCKET_ERROR_VAL SOCKET_ERROR
-    #define CLOSE_SOCKET closesocket
-    #define GET_LAST_ERROR WSAGetLastError()
+    #define SOCK_ERR SOCKET_ERROR
+    #define CLOSE_SOCK closesocket
+    #define GET_ERR WSAGetLastError()
 #else
     #include <sys/socket.h>
     #include <netinet/in.h>
@@ -39,113 +26,99 @@
     #include <netinet/tcp.h>
     #include <netdb.h>
     typedef int socket_t;
-    #define SOCKET_ERROR_VAL (-1)
-    #define CLOSE_SOCKET close
-    #define GET_LAST_ERROR errno
+    #define SOCK_ERR (-1)
+    #define CLOSE_SOCK close
+    #define GET_ERR errno
 #endif
 
 #define SERVER_PORT 8080
-#define BUFFER_SIZE 4096
+#define BUF_SIZE 4096
 #define SERVER_IP "127.0.0.1"
 
-std::mutex message_queue_mutex;
-std::queue<std::string> message_queue;
-std::condition_variable message_cv;
-bool running = true;
+std::mutex msg_mutex;
+std::queue<std::string> msg_queue;
+std::condition_variable msg_cv;
+bool is_running = true;
 
-// ──────────────────────────────────────────────────────────────
-// CRYPTO ENGINE: Symmetric Encryption Layer
-// ──────────────────────────────────────────────────────────────
 class CryptoEngine {
 private:
-    // Shared secret key (in production, use key exchange like Diffie-Hellman)
-    static const std::string SHARED_KEY; // Client & server agree on this out-of-band
-    
-    // Rotation table to prevent simple XOR frequency analysis
-    static const unsigned char ROTATION_TABLE[256];
-    
-    // Compile-time validation: rotation table must be exactly 256 bytes
-    static_assert(sizeof(ROTATION_TABLE) == 256, "Rotation table must be 256 bytes");
+    static const std::string SHARED_KEY;
+    static const unsigned char ROT_TABLE[256];
+    static_assert(sizeof(ROT_TABLE) == 256, "Rotation table must be 256 bytes");
     
 public:
-    // Encrypt plaintext string → returns Base64-encoded ciphertext string
     static std::string encrypt(const std::string& plaintext) {
-        std::string result;
-        result.reserve(plaintext.length() * 2);
+        std::string out;
+        out.reserve(plaintext.length() * 2);
         
-        // XOR encryption with per-byte rotation
         for (size_t i = 0; i < plaintext.length(); ++i) {
-            unsigned char key_byte = SHARED_KEY[i % SHARED_KEY.length()];
-            unsigned char rotated = ROTATION_TABLE[(plaintext[i] + i) % 256];
-            unsigned char encrypted_byte = rotated ^ key_byte;
-            result += static_cast<char>(encrypted_byte);
+            unsigned char k = SHARED_KEY[i % SHARED_KEY.length()];
+            unsigned char r = ROT_TABLE[(plaintext[i] + i) % 256];
+            unsigned char e = r ^ k;
+            out += static_cast<char>(e);
         }
         
-        // Base64 encode to make ciphertext transmission-safe
-        return base64_encode(result);
+        return b64_encode(out);
     }
     
-    // Decrypt Base64-encoded ciphertext → returns original plaintext
-    static std::string decrypt(const std::string& ciphertext_b64) {
-        std::string ciphertext = base64_decode(ciphertext_b64);
-        std::string result;
-        result.reserve(ciphertext.length());
+    static std::string decrypt(const std::string& cipher_b64) {
+        std::string cipher = b64_decode(cipher_b64);
+        std::string out;
+        out.reserve(cipher.length());
         
-        for (size_t i = 0; i < ciphertext.length(); ++i) {
-            unsigned char key_byte = SHARED_KEY[i % SHARED_KEY.length()];
-            unsigned char decrypted_rotated = ciphertext[i] ^ key_byte;
-            unsigned char original = (decrypted_rotated + 256 - ROTATION_TABLE[(i) % 256]) % 256;
-            result += static_cast<char>(original);
+        for (size_t i = 0; i < cipher.length(); ++i) {
+            unsigned char k = SHARED_KEY[i % SHARED_KEY.length()];
+            unsigned char d = cipher[i] ^ k;
+            unsigned char orig = (d + 256 - ROT_TABLE[i % 256]) % 256;
+            out += static_cast<char>(orig);
         }
         
-        return result;
+        return out;
     }
     
-    // Base64 encoding (RFC 4648)
-    static std::string base64_encode(const std::string& input) {
-        static const char* base64_chars = 
+    static std::string b64_encode(const std::string& in) {
+        static const char* chars = 
             "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
         
         std::string ret;
-        int i = 0;
-        unsigned char char_array_3[3];
-        unsigned char char_array_4[4];
+        int idx = 0;
+        unsigned char buf3[3];
+        unsigned char buf4[4];
         
-        for (unsigned char c : input) {
-            char_array_3[i++] = c;
-            if (i == 3) {
-                char_array_4[0] = (char_array_3[0] & 0xfc) >> 2;
-                char_array_4[1] = ((char_array_3[0] & 0x03) << 4) + ((char_array_3[1] & 0xf0) >> 4);
-                char_array_4[2] = ((char_array_3[1] & 0x0f) << 2) + ((char_array_3[2] & 0xc0) >> 6);
-                char_array_4[3] = char_array_3[2] & 0x3f;
+        for (unsigned char c : in) {
+            buf3[idx++] = c;
+            if (idx == 3) {
+                buf4[0] = (buf3[0] & 0xfc) >> 2;
+                buf4[1] = ((buf3[0] & 0x03) << 4) + ((buf3[1] & 0xf0) >> 4);
+                buf4[2] = ((buf3[1] & 0x0f) << 2) + ((buf3[2] & 0xc0) >> 6);
+                buf4[3] = buf3[2] & 0x3f;
                 
                 for (int j = 0; j < 4; j++)
-                    ret += base64_chars[char_array_4[j]];
-                i = 0;
+                    ret += chars[buf4[j]];
+                idx = 0;
             }
         }
         
-        if (i) {
-            for (int j = i; j < 3; j++)
-                char_array_3[j] = '\0';
+        if (idx) {
+            for (int j = idx; j < 3; j++)
+                buf3[j] = '\0';
                 
-            char_array_4[0] = (char_array_3[0] & 0xfc) >> 2;
-            char_array_4[1] = ((char_array_3[0] & 0x03) << 4) + ((char_array_3[1] & 0xf0) >> 4);
-            char_array_4[2] = ((char_array_3[1] & 0x0f) << 2) + ((char_array_3[2] & 0xc0) >> 6);
-            char_array_4[3] = char_array_3[2] & 0x3f;
+            buf4[0] = (buf3[0] & 0xfc) >> 2;
+            buf4[1] = ((buf3[0] & 0x03) << 4) + ((buf3[1] & 0xf0) >> 4);
+            buf4[2] = ((buf3[1] & 0x0f) << 2) + ((buf3[2] & 0xc0) >> 6);
+            buf4[3] = buf3[2] & 0x3f;
             
-            for (int j = 0; j < i + 1; j++)
-                ret += base64_chars[char_array_4[j]];
+            for (int j = 0; j < idx + 1; j++)
+                ret += chars[buf4[j]];
                 
-            while ((i++ < 3))
+            while (idx++ < 3)
                 ret += '=';
         }
         
         return ret;
     }
     
-    // Base64 decoding
-    static std::string base64_decode(const std::string& encoded) {
+    static std::string b64_decode(const std::string& encoded) {
         static const unsigned char dtable[256] = {
             0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
             0,0,0,0,0,0,0,0,0,0,0,62,0,62,0,63,52,53,54,55,56,57,58,59,60,61,
@@ -169,9 +142,8 @@ public:
     }
 };
 
-// Initialize static members
 const std::string CryptoEngine::SHARED_KEY = "SecureVaultMilitaryGradeKey2024";
-const unsigned char CryptoEngine::ROTATION_TABLE[256] = {
+const unsigned char CryptoEngine::ROT_TABLE[256] = {
     0x12, 0x34, 0x56, 0x78, 0x90, 0xAB, 0xCD, 0xEF,
     0x21, 0x43, 0x65, 0x87, 0xA9, 0xCB, 0xED, 0x0F,
     0x39, 0x5B, 0x7D, 0x9F, 0xB1, 0xD3, 0xF5, 0x17,
@@ -206,12 +178,9 @@ const unsigned char CryptoEngine::ROTATION_TABLE[256] = {
     0x78, 0x9A, 0xBC, 0xDE, 0xE0, 0x02, 0x24, 0x46
 };
 
-// ──────────────────────────────────────────────────────────────
-// CLIENT INTERFACE
-// ──────────────────────────────────────────────────────────────
 
-void receive_thread(socket_t sock) {
-    char buffer[BUFFER_SIZE];
+void recv_thread(socket_t sock) {
+    char buf[BUF_SIZE];
     
     std::cout << "\n[+] SECURE CHANNEL ESTABLISHED" << std::endl;
     std::cout << R"(
@@ -224,54 +193,55 @@ void receive_thread(socket_t sock) {
 ║  • Socket Buffer Security: Protected at transport layer  ║
 ╚═══════════════════════════════════════════════════════════╝
 )" << std::endl;
-    std::cout << "\n[+] Type your message and press Enter to send." << std::endl;
-    std::cout << "[+] Type /quit to exit.\n" << std::endl;
+    std::cout << "\n[+] Type message, hit Enter. /quit to exit.\n" << std::endl;
 
-    while (running) {
-        memset(buffer, 0, BUFFER_SIZE);
+    while (is_running) {
+        memset(buf, 0, BUF_SIZE);
         
-        ssize_t bytes_received = recv(sock, buffer, BUFFER_SIZE, 0);
-        if (bytes_received <= 0) {
-            std::cout << "\n[-] Connection to server lost." << std::endl;
-            running = false;
-            message_cv.notify_all();
+        ssize_t bytes = recv(sock, buf, BUF_SIZE, 0);
+        if (bytes <= 0) {
+            std::cout << "\n[!] Connection dropped. Server maybe down?" << std::endl;
+            is_running = false;
+            msg_cv.notify_all();
             break;
         }
         
         try {
-            std::string encrypted_msg(buffer, bytes_received);
-            std::string plaintext = CryptoEngine::decrypt(encrypted_msg);
+            std::string enc_msg(buf, bytes);
+            std::string plain = CryptoEngine::decrypt(enc_msg);
             
-            std::lock_guard<std::mutex> lock(message_queue_mutex);
-            std::cout << "\n[RECEIVED] " << plaintext << std::endl;
-            std::cout << "[INPUT] > " << std::flush;
-        } catch (const std::exception& e) {
-            std::cout << "\n[!] Decryption failed - possible tampering" << std::endl;
+            std::lock_guard<std::mutex> lock(msg_mutex);
+            std::cout << "\n[MSG] " << plain << std::endl;
+            std::cout << "> " << std::flush;
+        } catch (...) {
+            std::cout << "\n[!] Decrypt failed - tampering or bad key?" << std::endl;
         }
     }
 }
 
 void send_thread(socket_t sock) {
-    std::string message;
+    std::string msg;
     
-    while (running) {
-        std::cout << "[INPUT] > " << std::flush;
+    while (is_running) {
+        std::cout << "> " << std::flush;
         
-        std::getline(std::cin, message);
+        if (!std::getline(std::cin, msg))
+            break;
         
-        if (message == "/quit") {
-            running = false;
-            message_cv.notify_all();
+        if (msg == "/quit") {
+            is_running = false;
+            msg_cv.notify_all();
             break;
         }
         
-        if (message.empty()) continue;
+        if (msg.empty())
+            continue;
         
         try {
-            std::string encrypted = CryptoEngine::encrypt(message);
-            send(sock, encrypted.c_str(), encrypted.length(), 0);
+            std::string enc = CryptoEngine::encrypt(msg);
+            send(sock, enc.c_str(), enc.length(), 0);
         } catch (const std::exception& e) {
-            std::cout << "[!] Encryption error: " << e.what() << std::endl;
+            std::cout << "[!] Encrypt error: " << e.what() << std::endl;
         }
     }
 }
@@ -288,64 +258,64 @@ int main() {
 )" << std::endl;
 
 #if defined(_WIN32) || defined(_WIN64)
-    WSADATA wsaData;
-    int result = WSAStartup(MAKEWORD(2, 2), &wsaData);
-    if (result != 0) {
-        std::cerr << "[-] WSAStartup failed: " << result << std::endl;
+    WSADATA wsa;
+    int res = WSAStartup(MAKEWORD(2, 2), &wsa);
+    if (res != 0) {
+        std::cerr << "[!] Dang, winsock setup failed. Code: " << res << std::endl;
         return -1;
     }
 #endif
 
     socket_t sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (sock == SOCKET_ERROR_VAL) {
-        std::cerr << "[-] Socket creation failed" << std::endl;
+    if (sock == SOCK_ERR) {
+        std::cerr << "[!] Socket creation bombed. Error: " << GET_ERR << std::endl;
 #if defined(_WIN32) || defined(_WIN64)
         WSACleanup();
 #endif
         return -1;
     }
 
-    int tcp_nodelay = 1;
-    setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, (char*)&tcp_nodelay, sizeof(tcp_nodelay));
+    int nodelay = 1;
+    setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, (char*)&nodelay, sizeof(nodelay));
 
-    struct sockaddr_in server_addr;
-    server_addr.sin_family = AF_INET;
-    server_addr.sin_port = htons(SERVER_PORT);
+    struct sockaddr_in serv_addr;
+    memset(&serv_addr, 0, sizeof(serv_addr));
+    serv_addr.sin_family = AF_INET;
+    serv_addr.sin_port = htons(SERVER_PORT);
     
-    if (inet_pton(AF_INET, SERVER_IP, &server_addr.sin_addr) <= 0) {
-        std::cerr << "[-] Invalid server address" << std::endl;
-        CLOSE_SOCKET(sock);
+    if (inet_pton(AF_INET, SERVER_IP, &serv_addr.sin_addr) <= 0) {
+        std::cerr << "[!] Invalid IP address format. Check SERVER_IP macro." << std::endl;
+        CLOSE_SOCK(sock);
 #if defined(_WIN32) || defined(_WIN64)
         WSACleanup();
 #endif
         return -1;
     }
 
-    std::cout << "[+] Connecting to secure server..." << std::endl;
-    if (connect(sock, (struct sockaddr*)&server_addr, sizeof(server_addr)) == SOCKET_ERROR_VAL) {
-        std::cerr << "[-] Connection failed. Is server running on " << SERVER_IP << ":" << SERVER_PORT << "?" << std::endl;
-        std::cerr << "    Error code: " << GET_LAST_ERROR << std::endl;
-        CLOSE_SOCKET(sock);
+    std::cout << "[+] Connecting to " << SERVER_IP << ":" << SERVER_PORT << "..." << std::endl;
+    if (connect(sock, (struct sockaddr*)&serv_addr, sizeof(serv_addr)) == SOCK_ERR) {
+        std::cerr << "[!] Connection failed! Is server running?" << std::endl;
+        std::cerr << "    Error code: " << GET_ERR << std::endl;
+        CLOSE_SOCK(sock);
 #if defined(_WIN32) || defined(_WIN64)
         WSACleanup();
 #endif
         return -1;
     }
 
-    std::cout << "[+] Connection established." << std::endl;
-    std::cout << "[+] Sending secure handshake..." << std::endl;
+    std::cout << "[+] Connected! Starting threads...\n" << std::endl;
 
-    std::thread recv_t(receive_thread, sock);
-    std::thread send_t(send_thread, sock);
+    std::thread r_thread(recv_thread, sock);
+    std::thread s_thread(send_thread, sock);
 
-    recv_t.join();
-    send_t.join();
+    r_thread.join();
+    s_thread.join();
 
-    CLOSE_SOCKET(sock);
+    CLOSE_SOCK(sock);
 #if defined(_WIN32) || defined(_WIN64)
     WSACleanup();
 #endif
 
-    std::cout << "\n[+] Terminated securely." << std::endl;
+    std::cout << "\n[+] Done. Later!" << std::endl;
     return 0;
 }
